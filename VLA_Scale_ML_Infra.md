@@ -11,7 +11,7 @@
 > **Repo:** [vgandhi1/vla-bench](https://github.com/vgandhi1/vla-bench) · **W&B Report:** https://wandb.ai/vgandhi1/vla-bench  
 > **Project Type:** ML Infrastructure / MLOps · **Stack:** PyTorch · HuggingFace · FlashAttention-2 · FSDP · WebDataset · W&B  
 > **Hardware target:** 2× RTX 3090 (24 GB VRAM each) via RunPod or equivalent  
-> **Strategic purpose:** Systematically profile a naive VLA training loop, apply three optimization layers in sequence, and document the throughput and VRAM gains at each step — proving training cost-viability without A100/H100 clusters.
+> **Strategic purpose:** Systematically profile a naive VLA training loop, apply three optimization layers in sequence, and document the throughput and VRAM gains at each step — proving training cost-viability for real-hardware fine-tuning in a sim-to-real pipeline, without A100/H100 clusters.
 
 ---
 
@@ -22,8 +22,8 @@
 3. [Phase 1 — Naive Baseline: Find the Bottleneck](#3-phase-1--naive-baseline-find-the-bottleneck)
 4. [Phase 2 — Data Ingestion Optimization](#4-phase-2--data-ingestion-optimization)
 5. [Phase 3 — Memory & Compute Optimization](#5-phase-3--memory--compute-optimization)
-6. [Phase 4 — W&B ROI Report](#6-phase-4--wb-roi-report)
-7. [Complete Optimized Training Script](#7-complete-optimized-training-script)
+6. [Complete Optimized Training Script](#6-complete-optimized-training-script)
+7. [Phase 4 — W&B ROI Report](#7-phase-4--wb-roi-report)
 8. [Benchmarking Protocol](#8-benchmarking-protocol)
 9. [Expected Results & Acceptance Criteria](#9-expected-results--acceptance-criteria)
 10. [Cost Analysis & ROI Framing](#10-cost-analysis--roi-framing)
@@ -43,15 +43,17 @@ Training Vision-Language-Action (VLA) models on teleoperation episode data is th
 
 The result: training a 7B-parameter VLM on 10,000 teleoperation episodes takes 72+ hours at $2.50/hr on RunPod = **$180+ per training run**. This makes rapid iteration (the core of research) economically untenable.
 
+This benchmark specifically targets the final stage of a sim-to-real pipeline — the real-hardware fine-tuning run that patches a simulation-trained policy against real-world distribution shift. This stage is cost-constrained in a way that simulator pretraining is not: sim runs are cheap and parallelizable on cloud TPUs; real-hardware fine-tuning runs on a fixed GPU rig, uses scarce human-collected episode data, and must iterate rapidly as new real-world failure modes are discovered. A 3× throughput improvement at this stage does not just save money — it compresses the feedback loop between a real-floor failure, a policy patch, and redeployment from days to hours.
+
 ### Optimization Targets
 
 | Metric | Naive Baseline | Target (Phase 3) | Expected Savings |
 |---|---|---|---|
 | GPU Utilization | ~40% | 85%+ | 2.1× throughput gain |
-| Peak VRAM (7B model) | ~42 GB combined | ~32 GB combined | Larger batch sizes |
-| Images/sec (2 GPU) | ~12 | ~40+ | 3.3× faster |
+| Peak VRAM (7B model) | ~38 GB combined | ~28 GB combined | Larger batch sizes |
+| Images/sec (2 GPU) | ~14 | ~40+ | 3.3× faster |
 | Multi-GPU Scaling Efficiency | ~65% | ~85%+ | Near-linear scaling |
-| Cost per training run | ~$180 | ~$55 | $125 savings per run |
+| Cost per training run (full 72-hr, 10K-episode dataset) | ~$180 | ~$55 | $125 savings per run |
 
 ### Why These Specific Optimizations
 
@@ -106,6 +108,7 @@ pip install flash-attn --no-build-isolation
 vla-bench/                              # github.com/vgandhi1/vla-bench
 ├── README.md                           # W&B report link, results summary, setup
 ├── requirements.txt
+├── .gitignore                          # Excludes data/, runs/, wandb/, __pycache__/
 ├── data/
 │   ├── prepare_dataset.py              # Convert raw episodes → WebDataset tarballs
 │   └── synthetic_episodes.py          # Generate synthetic VLA episodes for testing
@@ -202,50 +205,40 @@ if __name__ == "__main__":
 # training/baseline_train.py
 """
 Phase 1: Naive baseline training loop.
+
 Purpose: Establish bottleneck baseline metrics before optimization.
 Expected issues:
   - GPU utilization ~40% (CPU-bound image decoding)
   - Large VRAM spikes from naive attention
-  - OOM at batch_size >= 8 with 7B model
+  - OOM at batch_size >= 8 at 7B scale (scripts use 2.7B proxy; swap MODEL_ID for the full bottleneck profile)
 """
 
 import os
 import time
+import argparse
 import torch
-import torch.nn as nn
-import wandb
 from torch.utils.data import Dataset, DataLoader
+from torch.profiler import record_function
 from transformers import AutoProcessor, AutoModelForVision2Seq
-from torch.profiler import profile, record_function, ProfilerActivity
+import wandb
 import json
 from PIL import Image
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MODEL_ID = "Salesforce/blip2-opt-2.7b"   # Start with 2.7B; swap for 7B for real runs
-BATCH_SIZE = 4
-NUM_WORKERS = 2                           # Low to simulate naive baseline
-LEARNING_RATE = 1e-4
-MAX_STEPS = 100                           # Short run for profiling
-PROFILE_STEPS = (10, 20)                  # Profile steps 10-20
-DATA_DIR = "data/raw_episodes"
+from utils.metrics import get_gpu_utilization
+from utils.profiler_utils import make_profiler
 
-# ── W&B init ──────────────────────────────────────────────────────────────────
-wandb.init(
-    project="vla-scale",
-    name="phase1-naive-baseline",
-    config={
-        "model": MODEL_ID,
-        "batch_size": BATCH_SIZE,
-        "num_workers": NUM_WORKERS,
-        "optimization": "none",
-        "flash_attention": False,
-        "fsdp": False,
-        "activation_checkpointing": False,
-        "webdataset": False,
-    }
-)
 
-# ── Dataset: naive implementation ────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="Salesforce/blip2-opt-2.7b")
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--max_steps", type=int, default=200)
+    p.add_argument("--data_dir", type=str, default="data/raw_episodes")
+    p.add_argument("--wandb_run_name", type=str, default="phase1-naive-baseline")
+    return p.parse_args()
+
+
 class NaiveVLADataset(Dataset):
     """Naive dataset: loads all metadata upfront, decodes images on-the-fly in main process."""
 
@@ -253,13 +246,13 @@ class NaiveVLADataset(Dataset):
         self.processor = processor
         self.samples = []
 
-        for ep_dir in sorted(os.listdir(data_dir))[:200]:   # First 200 episodes
+        for ep_dir in sorted(os.listdir(data_dir))[:200]:
             meta_path = os.path.join(data_dir, ep_dir, "metadata.json")
             if not os.path.exists(meta_path):
                 continue
             with open(meta_path) as f:
                 meta = json.load(f)
-            for frame in meta['frames'][::5]:   # Every 5th frame
+            for frame in meta['frames'][::5]:
                 self.samples.append({
                     "image_path": frame['image_path'],
                     "action": frame['action'],
@@ -271,7 +264,7 @@ class NaiveVLADataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        # ← This image decode runs in the MAIN PROCESS, blocking GPU
+        # Image decode runs in the MAIN PROCESS, blocking GPU
         image = Image.open(sample['image_path']).convert("RGB")
         inputs = self.processor(
             images=image,
@@ -286,37 +279,43 @@ class NaiveVLADataset(Dataset):
 
 
 def main():
+    args = parse_args()
     device = torch.device("cuda:0")
 
-    print(f"Loading model: {MODEL_ID}")
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    wandb.init(
+        project="vla-scale",
+        name=args.wandb_run_name,
+        config={
+            "model": args.model,
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "optimization": "none",
+            "flash_attention": False,
+            "fsdp": False,
+            "activation_checkpointing": False,
+            "webdataset": False,
+        }
+    )
+
+    print(f"Loading model: {args.model}")
+    processor = AutoProcessor.from_pretrained(args.model)
     model = AutoModelForVision2Seq.from_pretrained(
-        MODEL_ID,
+        args.model,
         torch_dtype=torch.float16,
     ).to(device)
 
-    # Naive: NO flash attention, NO FSDP, NO activation checkpointing
-
-    dataset = NaiveVLADataset(DATA_DIR, processor)
+    dataset = NaiveVLADataset(args.data_dir, processor)
     dataloader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,   # ← Low; workers don't prefetch fast enough
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,   # ← Low; workers don't prefetch fast enough
         pin_memory=True,
         shuffle=True,
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-    # ── Profiler setup ────────────────────────────────────────────────────────
-    profiler = torch.profiler.profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=5, warmup=5, active=10),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./runs/baseline'),
-        record_shapes=True,
-        with_stack=True,
-    )
-
+    profiler = make_profiler("runs/baseline")
     model.train()
     profiler.start()
 
@@ -324,11 +323,10 @@ def main():
     epoch_start = time.time()
 
     for batch_inputs, actions in dataloader:
-        if step >= MAX_STEPS:
+        if step >= args.max_steps:
             break
 
         step_start = time.time()
-
         batch_inputs = {k: v.to(device) for k, v in batch_inputs.items()}
 
         with record_function("forward_pass"):
@@ -340,9 +338,8 @@ def main():
             loss.backward()
             optimizer.step()
 
-        # ── Metrics ───────────────────────────────────────────────────────────
         step_time = time.time() - step_start
-        imgs_per_sec = BATCH_SIZE / step_time
+        imgs_per_sec = args.batch_size / step_time
         vram_used = torch.cuda.max_memory_allocated(device) / (1024**3)
 
         wandb.log({
@@ -364,19 +361,6 @@ def main():
     profiler.stop()
     wandb.finish()
     print(f"\nBaseline complete. Total time: {time.time() - epoch_start:.1f}s")
-
-
-def get_gpu_utilization():
-    """Query nvidia-smi for GPU utilization percent."""
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
-            capture_output=True, text=True
-        )
-        return float(result.stdout.strip().split('\n')[0])
-    except Exception:
-        return 0.0
 
 
 if __name__ == "__main__":
@@ -687,9 +671,224 @@ fsdp_apply_ac(model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check
 
 ---
 
-## 6. Phase 4 — W&B ROI Report
+## 6. Complete Optimized Training Script
 
-### 6.1 W&B Initialization for Optimized Run
+```python
+# training/optimized_train.py
+"""
+Phase 3: Fully optimized VLA training script.
+Optimizations: WebDataset + FlashAttention-2 + FSDP + Activation Checkpointing
+Run with: torchrun --nproc_per_node=2 training/optimized_train.py [args]
+"""
+
+import os
+import io
+import time
+import json
+import functools
+import argparse
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
+    BackwardPrefetch,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from transformers import AutoProcessor, AutoModelForVision2Seq
+import webdataset as wds
+import wandb
+from PIL import Image as PILImage
+
+from utils.metrics import ThroughputTracker, log_vram_stats, get_all_gpu_utilization
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="Salesforce/blip2-opt-2.7b")
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--max_steps", type=int, default=500)
+    p.add_argument("--shard_dir", type=str, default="data/webdataset_shards")
+    p.add_argument("--wandb_run_name", type=str, default="phase3-fully-optimized")
+    p.add_argument("--flash_attention", action="store_true")
+    p.add_argument("--fsdp", action="store_true")
+    p.add_argument("--activation_checkpointing", action="store_true")
+    p.add_argument("--webdataset", action="store_true")
+    return p.parse_args()
+
+
+SEQ_LEN = 64
+
+
+def decode_sample(sample, processor):
+    """Decode a WebDataset sample — runs in parallel worker processes."""
+    image = PILImage.open(io.BytesIO(sample['jpg'])).convert("RGB")
+    meta = json.loads(sample['json'].decode())
+    inputs = processor(
+        images=image, text=meta['instruction'],
+        return_tensors="pt", padding="max_length",
+        max_length=SEQ_LEN, truncation=True,
+    )
+    action = torch.tensor(meta['action'], dtype=torch.float32)
+    return {k: v.squeeze(0) for k, v in inputs.items()}, action
+
+
+def count_shards(shard_dir):
+    return len([f for f in os.listdir(shard_dir) if f.endswith('.tar')]) - 1
+
+
+def build_webdataset_loader(shard_dir, processor, batch_size, num_workers=8):
+    n_shards = count_shards(shard_dir)
+    shard_urls = f"{shard_dir}/shard_{{00000..{n_shards:05d}}}.tar"
+    dataset = (
+        wds.WebDataset(shard_urls, shardshuffle=True)
+        .shuffle(1000)
+        .decode("pil")
+        .to_tuple("jpg", "json")
+        .map(lambda x: decode_sample({"jpg": x[0], "json": x[1]}, processor))
+        .batched(batch_size, partial=False)
+    )
+    return wds.WebLoader(dataset, batch_size=None,
+                         num_workers=num_workers, pin_memory=True, prefetch_factor=4)
+
+
+def wrap_model_fsdp(model, device):
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        buffer_dtype=torch.bfloat16,
+    )
+    try:
+        from transformers.models.opt.modeling_opt import OPTDecoderLayer
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={OPTDecoderLayer},
+        )
+    except ImportError:
+        auto_wrap_policy = None
+
+    kwargs = dict(sharding_strategy=ShardingStrategy.FULL_SHARD,
+                  mixed_precision=mp_policy,
+                  backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+                  device_id=device)
+    if auto_wrap_policy is not None:
+        kwargs["auto_wrap_policy"] = auto_wrap_policy
+    return FSDP(model, **kwargs)
+
+
+def main():
+    args = parse_args()
+
+    # ── Distributed setup ─────────────────────────────────────────────────────
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    if rank == 0:
+        wandb.init(
+            project="vla-scale",
+            name=args.wandb_run_name,
+            config={
+                "model": args.model,
+                "batch_size": args.batch_size,
+                "num_workers": args.num_workers,
+                "flash_attention": args.flash_attention,
+                "fsdp": args.fsdp,
+                "activation_checkpointing": args.activation_checkpointing,
+                "webdataset": args.webdataset,
+                "n_gpus": world_size,
+                "mixed_precision": "bfloat16",
+            }
+        )
+
+    if rank == 0:
+        print(f"Loading {args.model}...")
+
+    processor = AutoProcessor.from_pretrained(args.model)
+
+    load_kwargs = {"torch_dtype": torch.bfloat16}
+    if args.flash_attention:
+        load_kwargs["attn_implementation"] = "flash_attention_2"
+
+    model = AutoModelForVision2Seq.from_pretrained(args.model, **load_kwargs)
+
+    if args.activation_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
+    if args.fsdp:
+        model = wrap_model_fsdp(model, device)
+    else:
+        model = model.to(device)
+
+    dataloader = build_webdataset_loader(
+        args.shard_dir, processor, args.batch_size, args.num_workers
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    tracker = ThroughputTracker(world_size=world_size)
+    torch.cuda.reset_peak_memory_stats()
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    model.train()
+    for step, (batch_inputs, actions) in enumerate(dataloader):
+        if step >= args.max_steps:
+            break
+
+        tracker.start_step()
+        batch_inputs = {k: v.to(device) for k, v in batch_inputs.items()}
+
+        outputs = model(**batch_inputs, labels=batch_inputs.get("input_ids"))
+        loss = outputs.loss
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        if args.fsdp:
+            model.clip_grad_norm_(1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        optimizer.step()
+
+        imgs_sec, tokens_sec = tracker.end_step(args.batch_size, SEQ_LEN)
+
+        if rank == 0 and step % 5 == 0:
+            vram = log_vram_stats()
+            gpu_utils = get_all_gpu_utilization()
+            wandb.log({
+                "step": step,
+                "loss": loss.item(),
+                "images_per_sec": imgs_sec,
+                "tokens_per_sec": tokens_sec,
+                **vram,
+                **gpu_utils,
+            })
+            print(f"Step {step:4d} | Loss: {loss.item():.4f} | "
+                  f"{imgs_sec:.1f} imgs/s | "
+                  f"VRAM: {vram['peak_vram_total_gb']:.1f} GB total")
+
+    if rank == 0:
+        wandb.finish()
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 7. Phase 4 — W&B ROI Report
+
+### 7.1 W&B Initialization for Optimized Run
 
 ```python
 # In training/optimized_train.py — W&B config
@@ -720,7 +919,7 @@ if rank == 0:
     )
 ```
 
-### 6.2 Metrics Logging
+### 7.2 Metrics Logging
 
 ```python
 # utils/metrics.py
@@ -786,7 +985,7 @@ def compute_scaling_efficiency(single_gpu_throughput, multi_gpu_throughput, n_gp
     return round(efficiency * 100, 1)
 ```
 
-### 6.3 Comprehensive Logging in Optimized Training Loop
+### 7.3 Comprehensive Logging in Optimized Training Loop
 
 ```python
 # In main training loop (rank 0 only)
@@ -813,7 +1012,7 @@ for step, (batch_inputs, actions) in enumerate(dataloader):
         })
 ```
 
-### 6.4 W&B Report Structure
+### 7.4 W&B Report Structure
 
 Create a W&B Report in the `vla-scale` project with the following sections:
 
@@ -854,153 +1053,10 @@ Cost at $2.50/hr: ~$8.75 per run
 
 Savings: $20+ per training run
 At 10 runs per research sprint: $200+ saved per sprint
-```
 
----
-
-## 7. Complete Optimized Training Script
-
-```python
-# training/optimized_train.py
-"""
-Phase 3: Fully optimized VLA training script.
-Optimizations: WebDataset + FlashAttention-2 + FSDP + Activation Checkpointing
-Run with: torchrun --nproc_per_node=2 training/optimized_train.py
-"""
-
-import os
-import time
-import functools
-import torch
-import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    ShardingStrategy,
-    BackwardPrefetch,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers import AutoProcessor, AutoModelForVision2Seq
-import wandb
-
-from utils.metrics import ThroughputTracker, log_vram_stats, get_all_gpu_utilization
-
-# ── Config ────────────────────────────────────────────────────────────────────
-MODEL_ID = "Salesforce/blip2-opt-2.7b"
-BATCH_SIZE = 16          # Increased from 4 due to VRAM savings
-NUM_WORKERS = 8          # Increased from 2 — WebDataset async decode
-LEARNING_RATE = 1e-4
-MAX_STEPS = 500
-SHARD_DIR = "data/webdataset_shards"
-SEQ_LEN = 64
-
-
-def main():
-    # ── Distributed setup ─────────────────────────────────────────────────────
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
-
-    if rank == 0:
-        wandb.init(
-            project="vla-scale",
-            name="phase3-fully-optimized",
-            config={
-                "model": MODEL_ID,
-                "batch_size": BATCH_SIZE,
-                "num_workers": NUM_WORKERS,
-                "flash_attention": True,
-                "fsdp": True,
-                "activation_checkpointing": True,
-                "webdataset": True,
-                "n_gpus": world_size,
-            }
-        )
-
-    # ── Model with FlashAttention-2 ───────────────────────────────────────────
-    if rank == 0:
-        print(f"Loading {MODEL_ID} with FlashAttention-2...")
-
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
-    model = AutoModelForVision2Seq.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
-
-    # Activation checkpointing (before FSDP wrapping)
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-
-    # FSDP wrapping
-    mp_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-        buffer_dtype=torch.bfloat16,
-    )
-    model = FSDP(
-        model,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        mixed_precision=mp_policy,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        device_id=device,
-    )
-
-    # ── WebDataset DataLoader ─────────────────────────────────────────────────
-    dataloader = build_webdataset_loader(SHARD_DIR, processor, BATCH_SIZE, NUM_WORKERS)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    tracker = ThroughputTracker(world_size=world_size)
-    torch.cuda.reset_peak_memory_stats()
-
-    # ── Training loop ─────────────────────────────────────────────────────────
-    model.train()
-    for step, (batch_inputs, actions) in enumerate(dataloader):
-        if step >= MAX_STEPS:
-            break
-
-        tracker.start_step()
-        batch_inputs = {k: v.to(device) for k, v in batch_inputs.items()}
-
-        outputs = model(**batch_inputs, labels=batch_inputs.get("input_ids"))
-        loss = outputs.loss
-
-        optimizer.zero_grad()
-        loss.backward()
-
-        # Gradient clipping (important with FSDP)
-        model.clip_grad_norm_(1.0)
-        optimizer.step()
-
-        imgs_sec, tokens_sec = tracker.end_step(BATCH_SIZE, SEQ_LEN)
-
-        if rank == 0 and step % 5 == 0:
-            vram = log_vram_stats()
-            gpu_utils = get_all_gpu_utilization()
-            wandb.log({
-                "step": step,
-                "loss": loss.item(),
-                "images_per_sec": imgs_sec,
-                "tokens_per_sec": tokens_sec,
-                **vram,
-                **gpu_utils,
-            })
-            print(f"Step {step:4d} | Loss: {loss.item():.4f} | "
-                  f"{imgs_sec:.1f} imgs/s | "
-                  f"VRAM: {vram['peak_vram_total_gb']:.1f} GB total")
-
-    if rank == 0:
-        wandb.finish()
-
-    dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()
+In a sim-to-real context: the 3.3× throughput gain compresses the
+real-floor failure → policy patch → redeployment cycle from ~2 days
+to ~6 hours, enabling same-day iteration on new failure modes.
 ```
 
 ---
@@ -1017,7 +1073,7 @@ To produce valid W&B comparison charts, ensure all runs use:
 
 ### 8.2 Run Matrix
 
-| Run Name | GPUs | FlashAttn | FSDP | AckCkpt | WebDataset | Purpose |
+| Run Name | GPUs | FlashAttn | FSDP | ActCkpt | WebDataset | Purpose |
 |---|---|---|---|---|---|---|
 | `phase1-naive-baseline` | 1 | ✗ | ✗ | ✗ | ✗ | Bottleneck baseline |
 | `phase2-webdataset-only` | 1 | ✗ | ✗ | ✗ | ✓ | Isolate data loading gain |
@@ -1030,13 +1086,13 @@ To produce valid W&B comparison charts, ensure all runs use:
 ```bash
 # 1-GPU reference run (set CUDA_VISIBLE_DEVICES to use only GPU 0)
 CUDA_VISIBLE_DEVICES=0 python training/optimized_train.py \
-  --name phase3-1gpu-reference \
+  --wandb_run_name phase3-1gpu-reference \
   --flash_attention --activation_checkpointing --webdataset \
   --max_steps 100
 
 # 2-GPU run
 torchrun --nproc_per_node=2 training/optimized_train.py \
-  --name phase3-fully-optimized \
+  --wandb_run_name phase3-fully-optimized \
   --flash_attention --fsdp --activation_checkpointing --webdataset \
   --max_steps 100
 ```
@@ -1097,7 +1153,7 @@ print(f"Scaling efficiency: {scaling_efficiency:.1f}%")
 
 ### Interview Framing
 
-> *"By profiling the naive training loop with PyTorch Profiler, I identified that GPU utilization was 40% due to synchronous image decoding in the main process. Migrating to WebDataset streaming brought GPU utilization to 87%. Integrating FlashAttention-2 reduced peak VRAM by 26%, allowing batch size to increase from 4 to 16. FSDP with full sharding achieved 88% scaling efficiency across 2 GPUs — meaning we almost doubled throughput for the hardware cost. The net result was a 3.3× throughput improvement and a 65% cost reduction per training run."*
+> *"By profiling the naive training loop with PyTorch Profiler, I identified that GPU utilization was 40% due to synchronous image decoding in the main process. Migrating to WebDataset streaming brought GPU utilization to 87%. Integrating FlashAttention-2 reduced peak VRAM by 26%, allowing batch size to increase from 4 to 16. FSDP with full sharding achieved 88% scaling efficiency across 2 GPUs — meaning we almost doubled throughput for the hardware cost. The net result was a 3.3× throughput improvement and a 65% cost reduction per training run. The practical motivation was sim-to-real transfer: sim pretraining is cheap and parallelizable on cloud hardware, but real-hardware fine-tuning runs on a fixed GPU rig with scarce human-collected episodes. A 3× speedup there doesn't just save money — it compresses the feedback loop from a real-floor failure to a deployed policy patch from days to hours."*
 
 ---
 
@@ -1134,8 +1190,8 @@ profiling  multi-gpu  imitation-learning  huggingface  tensorboard
 [![FlashAttention](https://img.shields.io/badge/attention-FlashAttn--2-blue?style=flat-square)](https://github.com/Dao-AILab/flash-attention)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 
-> Systematic profiling and optimization of a VLA model training loop on 2× RTX 3090.
-> Three optimization layers applied in sequence with measured gains at each step.
+> Systematic profiling and optimization of the real-hardware fine-tuning stage in a sim-to-real VLA pipeline.
+> Three optimization layers applied in sequence — WebDataset, FlashAttention-2, FSDP — with measured gains at each step.
 > Full W&B comparison report linked above.
 
 ## Results summary
@@ -1274,7 +1330,7 @@ echo "=== Baseline complete. Check W&B for metrics. ==="
 
 ```bash
 #!/bin/bash
-# Phase 3: Fully optimized — 2 GPU, FSDP + FlashAttention-2 + WebDataset + AckCkpt
+# Phase 3: Fully optimized — 2 GPU, FSDP + FlashAttention-2 + WebDataset + ActCkpt
 # Expected: ~40 imgs/s, ~87% GPU utilization, batch_size 16+
 
 set -e

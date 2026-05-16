@@ -6,8 +6,8 @@
 [![FlashAttention](https://img.shields.io/badge/attention-FlashAttn--2-blue?style=flat-square)](https://github.com/Dao-AILab/flash-attention)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 
-> Systematic profiling and optimization of a VLA model training loop on 2× RTX 3090.
-> Three optimization layers applied in sequence with measured gains at each step.
+> Systematic profiling and optimization of the real-hardware fine-tuning stage in a sim-to-real VLA pipeline.
+> Three optimization layers applied in sequence — WebDataset, FlashAttention-2, FSDP — with measured gains at each step.
 > Full W&B comparison report linked above.
 
 ## Results Summary
@@ -63,6 +63,8 @@ Dense kernels = GPU fed continuously by WebDataset async workers.
 | Naive baseline | ~14 imgs/s | ~9.9 hrs | **$24.75** |
 | Phase 3 optimized | ~40 imgs/s | ~3.5 hrs | **$8.75** |
 | **Savings per run** | | **6.4 hrs** | **$16.00** |
+
+> In a sim-to-real pipeline, this time reduction compresses the real-floor failure → policy patch → redeployment cycle from ~2 days to ~6 hours, enabling same-day iteration on new failure modes.
 
 ### Research Sprint ROI
 

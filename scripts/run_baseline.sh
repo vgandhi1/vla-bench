@@ -1,6 +1,6 @@
 #!/bin/bash
 # Phase 1: Naive baseline — single GPU, standard DataLoader
-# Expected: ~12 imgs/s, ~40% GPU utilization, OOM at batch_size >= 8
+# Expected: ~12 imgs/s, ~40% GPU utilization; OOM at batch_size >= 8 at 7B scale (2.7B proxy used here)
 
 set -e
 echo "=== vla-bench: Phase 1 Baseline ==="

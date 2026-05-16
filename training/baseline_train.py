@@ -5,7 +5,7 @@ Purpose: Establish bottleneck baseline metrics before optimization.
 Expected issues:
   - GPU utilization ~40% (CPU-bound image decoding)
   - Large VRAM spikes from naive attention
-  - OOM at batch_size >= 8 with 7B model
+  - OOM at batch_size >= 8 at 7B scale (scripts use 2.7B proxy; swap MODEL_ID for the full bottleneck profile)
 """
 
 import os
