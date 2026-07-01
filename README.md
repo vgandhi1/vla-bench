@@ -1,3 +1,5 @@
+> ⚠️ **ARCHIVED (2026-06-30)** — consolidated into [vgandhi1/robotics](https://github.com/vgandhi1/robotics/tree/main/VLA-bench). Development continues there.
+
 # vla-bench
 
 [![W&B Report](https://img.shields.io/badge/W%26B-Report-FFBE00?style=flat-square&logo=weightsandbiases)](https://wandb.ai/vgandhi1/vla-bench)
